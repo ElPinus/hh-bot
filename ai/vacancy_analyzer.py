@@ -16,7 +16,7 @@ import logging
 import re
 from pathlib import Path
 
-from ai.deepseek_client import deepseek_chat, PRO_MODEL
+from ai.deepseek_client import deepseek_chat, PRO_MODEL, DEFAULT_MODEL
 
 logger = logging.getLogger(__name__)
 
@@ -114,24 +114,29 @@ async def analyze_vacancy_deep(vacancy: dict) -> dict:
 Верни структурированный разбор по схеме из системного промта. Только JSON,
 ничего больше."""
 
-    try:
-        raw = await deepseek_chat(
-            messages=[
-                {"role": "system", "content": _ANALYZER_SYSTEM_PROMPT},
-                {"role": "user", "content": user_prompt},
-            ],
-            temperature=0.3,
-            max_tokens=4000,
-            model=PRO_MODEL,
-            # thinking=False: in thinking mode the model dumped reasoning prose
-            # instead of JSON ("We are asked to generate a JSON..."), which broke
-            # parsing and forced the weaker single-stage fallback. Pro without
-            # thinking honours response_format=json_object reliably.
-            thinking=False,
-            response_format={"type": "json_object"},
-        )
-    except Exception as e:
-        logger.warning("vacancy_analyzer LLM call failed: %s", e)
+    # pro -> flash fallback on the SAME provider: under load pro overloads
+    # first (the "900-second timeout"); flash still answers and takes the full
+    # prompt (no Groq 413). thinking=False: thinking mode dumped reasoning prose
+    # instead of JSON, breaking parsing — pro/flash without thinking honour
+    # response_format=json_object reliably.
+    raw = None
+    for ds_model in (PRO_MODEL, DEFAULT_MODEL):
+        try:
+            raw = await deepseek_chat(
+                messages=[
+                    {"role": "system", "content": _ANALYZER_SYSTEM_PROMPT},
+                    {"role": "user", "content": user_prompt},
+                ],
+                temperature=0.3,
+                max_tokens=4000,
+                model=ds_model,
+                thinking=False,
+                response_format={"type": "json_object"},
+            )
+            break
+        except Exception as e:
+            logger.warning("vacancy_analyzer %s failed: %s", ds_model, e)
+    if raw is None:
         return {}
 
     # Extract JSON block — model may wrap in ``` or add brief text

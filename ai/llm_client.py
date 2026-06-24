@@ -35,31 +35,29 @@ async def llm_chat(
     errors: list[str] = []
 
     if DEEPSEEK_API_KEY:
-        try:
-            if model_tier == "premium":
-                # Pro model without thinking — higher quality than flash but
-                # deterministic output. Thinking mode tends to dump reasoning
-                # into reasoning_content and run out of tokens before writing
-                # the actual answer.
+        # DeepSeek model chain. Premium prefers pro (best quality) but falls
+        # back to flash ON THE SAME PROVIDER when pro is overloaded/slow — flash
+        # is lighter, usually stays up, and (unlike Groq) takes the full-size
+        # cover-letter prompt without a 413 Payload Too Large. Standard tier is
+        # flash-only. thinking=False: thinking mode dumps reasoning into
+        # reasoning_content and can run out of tokens before the real answer.
+        ds_models = (
+            [PRO_MODEL, DEFAULT_MODEL] if model_tier == "premium"
+            else [DEFAULT_MODEL]
+        )
+        for ds_model in ds_models:
+            try:
                 return await deepseek_chat(
                     messages,
                     temperature=temperature,
                     max_tokens=max_tokens,
-                    model=PRO_MODEL,
+                    model=ds_model,
                     thinking=False,
                     response_format=response_format,
                 )
-            return await deepseek_chat(
-                messages,
-                temperature=temperature,
-                max_tokens=max_tokens,
-                model=DEFAULT_MODEL,
-                thinking=False,
-                response_format=response_format,
-            )
-        except Exception as e:
-            logger.warning("DeepSeek failed, falling back to Groq: %s", e)
-            errors.append(f"deepseek={e}")
+            except Exception as e:
+                logger.warning("DeepSeek %s failed: %s", ds_model, e)
+                errors.append(f"deepseek/{ds_model}={e}")
 
     if GROQ_API_KEY:
         try:

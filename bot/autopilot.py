@@ -1,6 +1,7 @@
-"""Autopilot: continuous search + scoring + routing. Auto-apply is opt-in
-(AUTO_APPLY_ENABLED); scores below SCORE_AUTO_SKIP are dropped; everything
-else goes to Telegram for manual review. Posts a periodic summary."""
+"""Autopilot: continuous search + scoring + résumé routing. Auto-apply is opt-in
+(AUTO_APPLY_ENABLED); scores below SCORE_AUTO_SKIP are dropped (unless rescued
+by a strong profile-marker match); everything else goes to Telegram for manual
+review. Posts a periodic summary."""
 import asyncio
 import logging
 import os
@@ -8,7 +9,14 @@ from datetime import datetime
 
 from aiogram import Bot
 
-from config import TELEGRAM_ADMIN_ID, AUTO_APPLY_ENABLED
+from config import (
+    TELEGRAM_ADMIN_ID,
+    AUTO_APPLY_ENABLED,
+    HH_RESUME_SEARCH_URL,
+    HH_KEYWORD_FILTERS_ENABLED,
+    HH_RATING_FILTER_ENABLED,
+    HH_REMOTE_CHECK_ENABLED,
+)
 from db.storage import (
     save_vacancy,
     save_response,
@@ -18,11 +26,16 @@ from db.storage import (
     get_employer_rating_cached,
     save_employer_rating,
     is_duplicate_already_handled,
+    vacancy_exists,
+    set_vacancy_variant,
     log_action,
 )
 from parser.hh_client import HHClient
 from ai.analyzer import analyze_relevance
 from ai.cover_letter import generate_cover_letter
+from ai.variant_router import select_resume_variant
+from ai.resume_variants import RESUME_VARIANTS
+from ai.resume_feeds import enabled_feeds, apply_resume_for, apply_resume_hash_for
 
 logger = logging.getLogger(__name__)
 
@@ -42,38 +55,58 @@ SEARCH_PAUSE = int(os.getenv("AUTOPILOT_SEARCH_PAUSE", str(30 * 60)))  # default
 # === Scoring thresholds (0-100 relevance from the analyzer) ===
 # SCORE_AUTO_APPLY: at or above this the autopilot may auto-apply (only when
 #   AUTO_APPLY_ENABLED=true). Keep it high so only very confident hits apply.
-# SCORE_AUTO_SKIP: below this the vacancy is auto-skipped as a clear mismatch.
+# SCORE_AUTO_SKIP: below this the vacancy is auto-skipped as a clear mismatch
+#   (unless rescued by a strong profile-marker match — see profile_rescue).
 # Everything in between goes to Telegram for manual review. Tune both to your
 # analyzer's behaviour and how noisy a review queue you tolerate.
 # SCORE_AUTO_SKIP is imported by bot/tg_loop.py too (same floor for the TG monitor).
 SCORE_AUTO_APPLY = 90
-SCORE_AUTO_SKIP = 10
+SCORE_AUTO_SKIP = int(os.getenv("SCORE_AUTO_SKIP", "40"))
 
-MAX_VACANCIES_PER_CYCLE = int(os.getenv("AUTOPILOT_MAX_VACANCIES_PER_CYCLE", "20"))  # per filter
+# Floor for the profile-rescue path. A vacancy scoring below SCORE_AUTO_SKIP is
+# rescued to manual review only if it ALSO scores >= this. Below it we trust the
+# analyzer's low score and skip, so a confident mismatch isn't surfaced just
+# because the title carries a profile keyword. Env-overridable; raise toward
+# SCORE_AUTO_SKIP for stricter surfacing, lower toward 0 for broader rescue.
+RESCUE_MIN_SCORE = int(os.getenv("RESCUE_MIN_SCORE", "25"))
+
+MAX_VACANCIES_PER_CYCLE = int(os.getenv("AUTOPILOT_MAX_VACANCIES_PER_CYCLE", "20"))  # SURFACED cards per feed
+# Hard cap on EXPENSIVE examinations (description fetch + deep LLM score) per
+# feed per cycle. MAX_VACANCIES_PER_CYCLE counts only SURFACED cards (see
+# run_search_cycle), so a feed full of sub-floor vacancies could otherwise keep
+# fetching+scoring while hunting for its surface quota. This bounds proxy/LLM
+# load. Defaults to 4x the surface target; lower it if the anti-bot ("short
+# body") warnings reappear.
+MAX_ANALYZED_PER_CYCLE = int(
+    os.getenv("AUTOPILOT_MAX_ANALYZED_PER_CYCLE", str(MAX_VACANCIES_PER_CYCLE * 4))
+)
 VACANCY_PAUSE = int(os.getenv("AUTOPILOT_VACANCY_PAUSE", "90"))  # seconds between vacancy analysis
+# How many SERP pages to fetch per search. Freshest-first ordering puts new
+# vacancies on page 0, so a low value suffices when processing few per cycle
+# and keeps proxy gotos down at a fast search cadence. Env-overridable.
+SEARCH_PAGES = int(os.getenv("AUTOPILOT_SEARCH_PAGES", "4"))
 
 # === Profile-overlap rescue ===
 # Even when the analyzer scores a vacancy below SCORE_AUTO_SKIP, the JD may
-# strongly overlap the candidate's actual profile (see PROFILE_MARKERS below).
+# strongly overlap the configured candidate profile (see PROFILE_MARKERS below).
 # Rescue such vacancies to manual review with a tag showing which marker
 # categories matched.
 #
-# Each category contributes its weight AT MOST ONCE — multiple hits in
-# one category don't compound (defends against "10x Python in one JD"
-# noise). Threshold 3 means: any AI/LLM-core or AI-product match alone
-# triggers, OR a combo of Product/PM + Tech-stack, OR Product/PM + Domain.
-# Pure tech-stack-only (Python dev) or pure-domain-only (B2B SaaS jobpost)
-# do NOT trigger — those are usually mismatches the analyzer rightly cut.
+# Each category contributes its weight AT MOST ONCE — multiple hits in one
+# category don't compound (defends against "10x Python in one JD" noise).
+# profile_rescue() (below) is the single gate, shared by the autopilot, the TG
+# monitor (bot/tg_loop.py) and the retroactive script
+# (scripts/overlap_rescue_existing.py) so the logic never drifts between them.
 PROFILE_OVERLAP_THRESHOLD = 3
 # ── TUNE ME ────────────────────────────────────────────────────────────────
 # PROFILE_MARKERS below is an ILLUSTRATIVE EXAMPLE for an AI/product-oriented
 # job seeker; the keywords are generic placeholders. Replace each category's
 # list with the signal words of YOUR OWN profile before relying on the rescue.
 # Keep the category KEYS (especially "product/pm" and "web/agency stack"):
-# they are referenced by the overlap-rescue branch in run_search_cycle() and in
-# bot/tg_loop.py + scripts/overlap_rescue_existing.py. If you rename or drop a
-# category, update those call sites too. Markers work best when SPECIFIC;
-# overly generic tokens over-trigger on long JD stack enumerations.
+# they are referenced by profile_rescue() below and by bot/tg_loop.py +
+# scripts/overlap_rescue_existing.py. If you rename or drop a category, update
+# those call sites too. Markers work best when SPECIFIC; overly generic tokens
+# over-trigger on long JD stack enumerations.
 # ───────────────────────────────────────────────────────────────────────────
 PROFILE_MARKERS: dict[str, tuple[int, list[str]]] = {
     "ai/llm core": (3, [
@@ -141,12 +174,12 @@ PROFILE_MARKERS: dict[str, tuple[int, list[str]]] = {
 # Title-level engineer/designer markers — these indicate the role is
 # an IC engineer/designer position, not a management/PM role. Used by
 # `_title_looks_like_ic_role()` to suppress overlap-rescue when title
-# is clearly not the candidate's profile, regardless of how rich the
-# JD body is in AI/PM keywords.
+# is clearly not the configured profile, regardless of how rich the
+# JD body is in profile keywords.
 _IC_ROLE_TITLE_MARKERS = [
     # English — always preceded by a space (no compound words)
     " developer", " engineer", " designer", " analyst",
-    " researcher", " specialist", " programmer",
+    " researcher", " specialist", " programmer", " scientist",
     # Russian — no leading space so hyphenated forms also match
     # ("Backend-разработчик", "ML-инженер", "Frontend-разработчик")
     "разработчик", "программист",
@@ -170,7 +203,7 @@ def _title_looks_like_ic_role(title: str) -> bool:
     """True if title is a clear IC engineer/designer/analyst role
     WITHOUT a management anchor. When the configured profile targets
     management / product roles, pure IC roles shouldn't be rescued even when
-    the JD body is rich in AI/PM keywords (description-keyword false positives).
+    the JD body is rich in profile keywords (description-keyword false positives).
     """
     if not title:
         return False
@@ -194,7 +227,7 @@ def profile_overlap_score(
     Returns (total, matched_categories). Each category is all-or-nothing
     (its weight applied once if any of its markers occurs in either
     field), so noisy JDs with the same keyword repeated don't inflate
-    the score. Used by the autopilot to "rescue" low-LLM-score
+    the score. Used by profile_rescue() to "rescue" low-LLM-score
     vacancies into manual review — see PROFILE_OVERLAP_THRESHOLD.
     """
     if not description and not title:
@@ -208,9 +241,42 @@ def profile_overlap_score(
             matched.append(cat)
     return total, matched
 
+
+def profile_rescue(
+    description: str, title: str = ""
+) -> tuple[bool, int, list[str]]:
+    """Decide whether a below-floor vacancy should be rescued to manual review.
+
+    SINGLE SOURCE OF TRUTH for the rescue gate — used by the hh autopilot,
+    the TG monitor (bot/tg_loop.py) and the retroactive rescue script
+    (scripts/overlap_rescue_existing.py). Keep the logic here only so the three
+    call sites never drift.
+
+    Rescue requires:
+      (a) total overlap >= PROFILE_OVERLAP_THRESHOLD, AND
+      (b) at least one ROLE-relevant category — "product/pm" (management/lead
+          role) OR "web/agency stack" (second-profile roles), so a pure
+          tech-stack or domain keyword match alone doesn't rescue, AND
+      (c) the title is NOT a clear IC engineer/designer role without a
+          management anchor (their JD bodies often mention management/PM words
+          for a role the configured profile doesn't take).
+
+    Returns (eligible, overlap, matched_categories). overlap/categories are
+    returned even when not eligible so callers can log or tag the card.
+
+    ILLUSTRATIVE gate keyed to the example PROFILE_MARKERS — retune the markers
+    and the role-relevant categories below to YOUR profile.
+    """
+    overlap, cats = profile_overlap_score(description, title)
+    role_match = ("product/pm" in cats) or ("web/agency stack" in cats)
+    ic_role = _title_looks_like_ic_role(title)
+    eligible = overlap >= PROFILE_OVERLAP_THRESHOLD and role_match and not ic_role
+    return eligible, overlap, cats
+
+
 # Minimum employer rating on hh.ru to consider applying. Companies without
 # a rating widget (None) are NOT filtered out — small / new companies often
-# have no rating yet, and some of them are AI startups worth applying to.
+# have no rating yet, and some of them are startups worth applying to.
 MIN_COMPANY_RATING = 3.5
 
 # Blacklisted companies — never apply (whole-word match on company name).
@@ -255,7 +321,7 @@ def _reset_stats():
 
 
 async def autopilot_loop(bot: Bot, hh_client: HHClient):
-    """Main autopilot loop. Searches continuously, sends summary every 2 hours."""
+    """Main autopilot loop. Searches continuously, posts a periodic summary."""
     await asyncio.sleep(60)  # wait 1 min after startup
     logger.info("Autopilot started")
 
@@ -284,7 +350,7 @@ async def autopilot_loop(bot: Bot, hh_client: HHClient):
 
 
 async def summary_loop(bot: Bot):
-    """Send summary every 2 hours."""
+    """Send a summary every SUMMARY_INTERVAL seconds."""
     while True:
         await asyncio.sleep(SUMMARY_INTERVAL)
         try:
@@ -294,20 +360,76 @@ async def summary_loop(bot: Bot):
 
 
 async def run_search_cycle(bot: Bot, hh_client: HHClient):
-    """Run one search cycle: find, analyze, auto-apply/skip."""
-    filters = get_active_filters()
-    if not filters:
+    """Run one search cycle across all configured sources.
+
+    Sources, in priority order:
+      1. Per-variant résumé feeds (resume-variants/feeds.yaml), each tagged with
+         its variant so the router gets a source hint and the card shows the
+         right résumé.
+      2. Legacy single HH_RESUME_SEARCH_URL — used only when feeds.yaml has no
+         enabled feed (so the bot keeps working with a single résumé).
+      3. Keyword filters (the `filters` DB table) — only when
+         HH_KEYWORD_FILTERS_ENABLED.
+    """
+    # Each source is (label, search_thunk, source_variant): source_variant is
+    # the résumé variant whose "similar vacancies" feed this is, or None for the
+    # legacy single feed / keyword filters. It becomes a soft hint to the router.
+    # NB: with several feeds enabled the cycle does one search goto per feed and
+    # processes up to MAX_VACANCIES_PER_CYCLE *per feed* — more proxy load than
+    # a single feed; tune SEARCH_PAUSE / MAX if the anti-bot warnings reappear.
+    sources: list[tuple[str, object, str | None]] = []
+    feeds = enabled_feeds()
+    if feeds:
+        for vkey, url in feeds:
+            label = f"резюме #{vkey} {RESUME_VARIANTS[vkey]['short']}"
+            sources.append(
+                (label,
+                 lambda url=url: hh_client.search_by_url(url, pages=SEARCH_PAGES),
+                 vkey)
+            )
+    elif HH_RESUME_SEARCH_URL:
+        sources.append(
+            ("resume-поиск",
+             lambda: hh_client.search_by_url(HH_RESUME_SEARCH_URL, pages=SEARCH_PAGES),
+             None)
+        )
+    if HH_KEYWORD_FILTERS_ENABLED:
+        for f in get_active_filters():
+            sources.append(
+                (f["name"],
+                 lambda f=f: hh_client.search_vacancies(f, pages=SEARCH_PAGES),
+                 None)
+            )
+    if not sources:
+        logger.warning(
+            "Autopilot: no search sources — set HH_RESUME_SEARCH_URL or enable "
+            "keyword filters (HH_KEYWORD_FILTERS_ENABLED)"
+        )
         return
 
-    for f in filters:
+    for source_label, do_search, source_variant in sources:
         try:
             async with HH_LOCK:
-                vacancies = await hh_client.search_vacancies(f)
-            processed = 0
+                vacancies = await do_search()
+            processed = 0  # SURFACED this cycle (cards sent / auto-applied)
+            analyzed = 0   # EXPENSIVE examinations (desc fetch + LLM) this cycle
             for v in vacancies:
                 if processed >= MAX_VACANCIES_PER_CYCLE:
-                    logger.info("Autopilot: reached %d vacancy limit for this cycle", MAX_VACANCIES_PER_CYCLE)
+                    logger.info("Autopilot: reached %d surfaced limit for this cycle", MAX_VACANCIES_PER_CYCLE)
                     break
+                if analyzed >= MAX_ANALYZED_PER_CYCLE:
+                    logger.info(
+                        "Autopilot: reached %d analysis cap (%d surfaced) for this cycle",
+                        MAX_ANALYZED_PER_CYCLE, processed,
+                    )
+                    break
+                # Already examined in a previous cycle? Skip instantly — the
+                # résumé search re-returns the same freshest vacancies every
+                # few minutes; without this we'd re-open (proxy goto) and
+                # re-score (LLM) each one every cycle, flooding the LLM and the
+                # anti-bot. New ones (not yet in the table) fall through.
+                if vacancy_exists(v["id"]):
+                    continue
                 # Check company blacklist
                 company_lower = v.get("company", "").lower()
                 if any(bl in company_lower for bl in COMPANY_BLACKLIST):
@@ -355,6 +477,10 @@ async def run_search_cycle(bot: Bot, hh_client: HHClient):
                     _stats["auto_skipped"] += 1
                     continue
 
+                # Commit to the expensive path (proxy goto + deep LLM score):
+                # count it against the per-feed analysis cap.
+                analyzed += 1
+
                 async with HH_LOCK:
                     desc = await hh_client.get_vacancy_description(v["url"])
                     v["description"] = desc
@@ -382,7 +508,7 @@ async def run_search_cycle(bot: Bot, hh_client: HHClient):
                     rating_source or "none",
                 )
 
-                if not is_remote:
+                if HH_REMOTE_CHECK_ENABLED and not is_remote:
                     logger.info("Autopilot: skipping %s (no remote), %s", v["id"], v["title"])
                     v["relevance_score"] = 0
                     v["relevance"] = "low"
@@ -393,7 +519,7 @@ async def run_search_cycle(bot: Bot, hh_client: HHClient):
                     await asyncio.sleep(VACANCY_PAUSE)
                     continue
 
-                if rating is not None and rating > 0 and rating < MIN_COMPANY_RATING:
+                if HH_RATING_FILTER_ENABLED and rating is not None and rating > 0 and rating < MIN_COMPANY_RATING:
                     logger.info(
                         "Autopilot: skipping %s (low rating %.1f < %.1f), %s",
                         v["id"], rating, MIN_COMPANY_RATING, v["title"],
@@ -407,64 +533,65 @@ async def run_search_cycle(bot: Bot, hh_client: HHClient):
                     await asyncio.sleep(VACANCY_PAUSE)
                     continue
 
-                # Light flash screening (deep=False) to keep autopilot fast and
-                # off the overloaded DeepSeek/proxy path. The deep pro analysis
-                # still runs at letter-generation time (generate_cover_letter).
-                analysis = await analyze_relevance(v, deep=False)
+                # Precise pro analysis (deep=True): drives the auto-apply
+                # decision, so it runs the full scoring against the candidate
+                # summary. Affordable here because the per-feed caps bound how
+                # many vacancies reach this point each cycle.
+                analysis = await analyze_relevance(v, deep=True)
                 v.update(analysis)
 
                 if save_vacancy(v):
-                    processed += 1
                     _stats["found"] += 1
                     score = v.get("relevance_score", 0)
 
-                    # Route by score, with a profile-overlap rescue branch
-                    # for low-scored vacancies that nevertheless overlap
-                    # the candidate's actual profile (see PROFILE_MARKERS).
-                    overlap_meta = ""  # populated only on rescue
+                    # Profile-marker awareness: does the JD overlap the configured
+                    # profile markers? profile_rescue is the single source of truth
+                    # (see its docstring). Used three ways: matched_cats on the card,
+                    # strong_profile drives the "🎯 ПО ПРОФИЛЮ" header, and
+                    # strong_profile rescues a below-floor vacancy the analyzer's
+                    # generic gate wrongly cut.
+                    strong_profile, overlap, matched_cats = profile_rescue(
+                        v.get("description", ""), v.get("title", ""),
+                    )
+
+                    rescued = False
                     if score < SCORE_AUTO_SKIP:
-                        overlap, matched_cats = profile_overlap_score(
-                            v.get("description", ""),
-                            v.get("title", ""),
-                        )
-                        # Rescue requires:
-                        #   (a) total overlap >= threshold, AND
-                        #   (b) at least one ROLE-relevant category —
-                        #       "product/pm" (management/lead role) OR
-                        #       "web/agency stack" (second-profile web roles), AND
-                        #   (c) title is NOT a clear IC engineer/designer
-                        #       role without a management anchor.
-                        # Why (c): JD bodies of engineer vacancies often
-                        # describe team context with management words
-                        # ("you'll work with the tech lead", "stakeholder
-                        # alignment"), inflating product/pm category for
-                        # a role the candidate doesn't take. Title is the
-                        # cleanest signal.
-                        role_match = (
-                            "product/pm" in matched_cats
-                            or "web/agency stack" in matched_cats
-                        )
-                        ic_role = _title_looks_like_ic_role(v.get("title", ""))
-                        if (
-                            overlap >= PROFILE_OVERLAP_THRESHOLD
-                            and role_match
-                            and not ic_role
-                        ):
-                            overlap_meta = (
-                                f"[overlap={overlap}] cats: "
-                                f"{', '.join(matched_cats)}"
-                            )
+                        # Below the auto-skip floor — drop it UNLESS it strongly
+                        # matches the profile markers AND isn't a confident
+                        # mismatch (score >= RESCUE_MIN_SCORE).
+                        if strong_profile and score >= RESCUE_MIN_SCORE:
+                            rescued = True
                             logger.info(
                                 "Autopilot: rescuing %s to manual review "
-                                "(score=%d, %s) — %s",
-                                v["id"], score, overlap_meta, v["title"],
+                                "(score=%d, overlap=%d cats: %s) — %s",
+                                v["id"], score, overlap,
+                                ", ".join(matched_cats), v["title"],
                             )
-                            # fall through to the manual-review branch below
                         else:
+                            if strong_profile:
+                                logger.info(
+                                    "Autopilot: NOT rescuing %s — score %d < "
+                                    "RESCUE_MIN_SCORE %d (confident mismatch) — %s",
+                                    v["id"], score, RESCUE_MIN_SCORE, v["title"],
+                                )
                             mark_skipped(v["id"])
                             _stats["auto_skipped"] += 1
                             await asyncio.sleep(VACANCY_PAUSE)
                             continue
+
+                    # Survived the skip gate -> SURFACED. Count against the
+                    # per-feed surface quota (MAX_VACANCIES_PER_CYCLE = surfaced
+                    # cards, not raw analyses).
+                    processed += 1
+
+                    # Surfaced — route to the best résumé variant NOW, after the
+                    # skip gate, so the router runs only on vacancies the user
+                    # will actually see. The row was saved above without a
+                    # variant; persist the choice so the apply button, the letter
+                    # register and the apply-modal selection all agree.
+                    variant_key, _vr = await select_resume_variant(v, source_variant)
+                    v["resume_variant"] = variant_key
+                    set_vacancy_variant(v["id"], variant_key)
 
                     if AUTO_APPLY_ENABLED and score >= SCORE_AUTO_APPLY:
                         success = await auto_apply(hh_client, v)
@@ -472,56 +599,65 @@ async def run_search_cycle(bot: Bot, hh_client: HHClient):
                             _stats["errors"] += 1
 
                     else:
-                        # 30-89 OR low-score-but-rescued-by-overlap:
-                        # send to Telegram for manual review.
+                        # Manual-review card: auto-apply frozen, or score in
+                        # the mid band, or a low score rescued by profile.
                         _stats["manual_review"] += 1
                         from bot.keyboards import vacancy_keyboard
                         rating_str = (
                             f"Рейтинг компании: {v.get('company_rating'):.1f}/5\n"
                             if v.get("company_rating") else ""
                         )
-                        if overlap_meta:
-                            # Rescue card: lead with overlap signal, not
-                            # with the analyzer's low score (low here
-                            # means "analyzer cut by role-type/AI-focus
-                            # gate, but JD overlaps your profile" — NOT
-                            # "bad vacancy"). Showing 10/100 first
-                            # reads as "skip this" and people pass.
-                            text = (
-                                f"🎯 OVERLAP-RESCUE\n"
-                                f"{v['title']}\n"
-                                f"{v.get('company', '')}\n"
-                                f"Зарплата: {v.get('salary') or 'не указана'}\n"
-                                f"Город: {v.get('city') or ''}\n"
-                                f"{rating_str}"
-                                f"{overlap_meta}\n"
-                                f"(analyzer={v.get('relevance_score', 0)}/100 — "
-                                f"низкий, режется по role-type гейту; "
-                                f"подняли через overlap-маркеры твоего профиля)"
-                            )
+                        # Profile-marker line — shown whenever any marker hit,
+                        # so you see which parts of your profile it touches.
+                        profile_line = (
+                            f"🎯 Профиль: {', '.join(matched_cats)} (overlap={overlap})\n"
+                            if matched_cats else ""
+                        )
+                        # Header priority: would-be auto-apply (90+) first,
+                        # then strong profile match, then analyzer relevance.
+                        if score >= SCORE_AUTO_APPLY:
+                            header = "🔥 СИЛЬНОЕ"
+                        elif strong_profile:
+                            header = "🎯 ПО ПРОФИЛЮ"
                         else:
-                            relevance_emoji = {"high": "[!!!]", "medium": "[!!]", "low": "[!]"}.get(
+                            header = {"high": "[!!!]", "medium": "[!!]", "low": "[!]"}.get(
                                 v.get("relevance", ""), "[?]"
                             )
-                            # Auto-apply is frozen — flag would-be auto-apply
-                            # hits (90+) as top-priority so you react fast.
-                            if v.get("relevance_score", 0) >= SCORE_AUTO_APPLY:
-                                relevance_emoji = "🔥 СИЛЬНОЕ"
-                            text = (
-                                f"{relevance_emoji} {v['title']}\n"
-                                f"{v.get('company', '')}\n"
-                                f"Зарплата: {v.get('salary') or 'не указана'}\n"
-                                f"Город: {v.get('city') or ''}\n"
-                                f"{rating_str}"
-                                f"Релевантность: {v.get('relevance_score', 0)}/100\n"
-                                f"Причина: {v.get('reason', '')}"
+                        if rescued:
+                            # Low analyzer score but on-profile — explain so a
+                            # 10/100 doesn't read as "skip me".
+                            score_line = (
+                                f"analyzer={score}/100 — низкий (режется по "
+                                f"role-type гейту), поднято по маркерам твоего "
+                                f"профиля\n"
                             )
-                        await bot.send_message(TELEGRAM_ADMIN_ID, text, reply_markup=vacancy_keyboard(v["id"], v["url"]))
+                        else:
+                            reason = v.get("reason", "")
+                            score_line = (
+                                f"Релевантность: {score}/100\n"
+                                + (f"Причина: {reason}\n" if reason else "")
+                            )
+                        text = (
+                            f"{header} {v['title']}\n"
+                            f"{v.get('company', '')}\n"
+                            f"Зарплата: {v.get('salary') or 'не указана'}\n"
+                            f"Город: {v.get('city') or ''}\n"
+                            f"{rating_str}"
+                            f"{profile_line}"
+                            f"{score_line}"
+                        )
+                        text += f"Источник: {source_label}"
+                        await bot.send_message(
+                            TELEGRAM_ADMIN_ID, text,
+                            reply_markup=vacancy_keyboard(
+                                v["id"], v["url"], v.get("resume_variant"),
+                            ),
+                        )
 
                 await asyncio.sleep(VACANCY_PAUSE)
 
         except Exception as e:
-            logger.error("Autopilot search error for filter %s: %s", f["name"], e)
+            logger.error("Autopilot search error for source %s: %s", source_label, e)
             _stats["errors"] += 1
 
     # also check previously found 90+ vacancies without response.
@@ -563,8 +699,8 @@ def _is_blacklisted(vacancy: dict) -> tuple[bool, str | None]:
 
     Why duplicated from run_search_cycle: vacancies can arrive at
     auto_apply via TWO paths — the live search loop (where the checks
-    above run) AND `get_auto_apply_candidates` (legacy DB rows scored
-    under an older, weaker blacklist). The second path bypassed those
+    above run) AND `get_auto_apply_candidates` (DB rows that may have been
+    scored under an older, weaker blacklist). The second path bypassed those
     checks entirely; this guard closes that hole.
     """
     company_lower = (vacancy.get("company") or "").lower()
@@ -598,8 +734,16 @@ async def auto_apply(hh_client: HHClient, vacancy: dict) -> bool:
             logger.warning("Auto-apply: empty cover letter for %s", vacancy["id"])
             return False
 
+        # Select the résumé tied to the routed variant in the apply modal
+        # (None leaves hh's default résumé selected).
+        _variant = vacancy.get("resume_variant")
+        resume_identifier = apply_resume_for(_variant)
+        resume_hash = apply_resume_hash_for(_variant)
         async with HH_LOCK:
-            success = await hh_client.apply_to_vacancy(vacancy["id"], letter)
+            success = await hh_client.apply_to_vacancy(
+                vacancy["id"], letter,
+                resume_identifier=resume_identifier, resume_hash=resume_hash,
+            )
         if success:
             save_response(vacancy["id"], letter, "sent")
             _stats["auto_applied"].append({
@@ -638,9 +782,9 @@ async def send_summary(bot: Bot):
     text = (
         f"Автопилот [{now}]\n\n"
         f"Новых вакансий: {_stats['found']}\n"
-        f"Автооткликов (90+): {len(applied)}{applied_text}\n\n"
-        f"На ручной просмотр (10-89 + overlap-rescue): {_stats['manual_review']}\n"
-        f"Автопропуск (<10): {_stats['auto_skipped']}\n"
+        f"Автооткликов ({SCORE_AUTO_APPLY}+): {len(applied)}{applied_text}\n\n"
+        f"На ручной просмотр: {_stats['manual_review']}\n"
+        f"Автопропуск: {_stats['auto_skipped']}\n"
         f"Ошибки: {_stats['errors']}"
     )
 

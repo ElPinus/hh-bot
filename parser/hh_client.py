@@ -1,7 +1,8 @@
 import json
+import re
 import asyncio
 import logging
-from urllib.parse import urlparse, urlencode
+from urllib.parse import urlparse, urlencode, parse_qsl
 from playwright.async_api import async_playwright, Browser, Page, BrowserContext
 from config import HH_LOGIN, HH_COOKIES_PATH, HH_PROXY
 
@@ -112,7 +113,13 @@ class HHClient:
         """
         async def _route(route):
             try:
-                if route.request.resource_type in _BLOCKED_RESOURCE_TYPES:
+                # _apply_mode loads the FULL page (CSS/JS/fonts) — hh's Magritte
+                # response form won't mount with stylesheets aborted. Search
+                # keeps blocking to save proxy bandwidth.
+                if (
+                    not getattr(self, "_apply_mode", False)
+                    and route.request.resource_type in _BLOCKED_RESOURCE_TYPES
+                ):
                     await route.abort()
                 else:
                     await route.continue_()
@@ -480,43 +487,98 @@ class HHClient:
         return "error:login_not_confirmed"
 
     async def search_vacancies(
-        self, filters: dict, pages: int = 4, per_page: int = 50
+        self, filters: dict, pages: int = 4, per_page: int = 50,
+        order_by: str = "publication_time",
     ) -> list[dict]:
         """Search vacancies by filters across multiple pages.
 
         Defaults: 4 pages × 50/page = up to 200 vacancies per filter per cycle.
-        Earlier the bot took only the first 20 of the first page — for a broad
-        query that can return thousands of results on hh.ru, that meant the
-        same top-20 cached vacancies forever and nothing new.
+        `order_by` defaults to publication_time (freshest first) so the
+        autopilot sees newly-posted vacancies before stale ones; pass
+        "relevance" for hh's relevance ordering.
 
         Stops early if any page returns no cards (end of results).
         """
-        base_params = {
-            "text": filters.get("keywords", ""),
-            "per_page": str(per_page),
-        }
+        base_params: list[tuple[str, str]] = [
+            ("text", filters.get("keywords", "")),
+            ("order_by", order_by),
+        ]
         if filters.get("city"):
             area = await self._resolve_area(filters["city"])
             if area:
-                base_params["area"] = area
+                base_params.append(("area", area))
         if filters.get("salary_from"):
-            base_params["salary"] = str(filters["salary_from"])
-            base_params["only_with_salary"] = "true"
+            base_params.append(("salary", str(filters["salary_from"])))
+            base_params.append(("only_with_salary", "true"))
         if filters.get("experience"):
-            base_params["experience"] = filters["experience"]
+            base_params.append(("experience", filters["experience"]))
         if filters.get("schedule"):
-            base_params["schedule"] = filters["schedule"]
+            base_params.append(("schedule", filters["schedule"]))
         # Restrict search to the vacancy title when requested (search_field=name)
         # so broad queries like "AI"/"ИИ" match titles, not description mentions.
         if filters.get("search_field"):
-            base_params["search_field"] = filters["search_field"]
+            base_params.append(("search_field", filters["search_field"]))
 
+        return await self._paginate_search(SEARCH_URL, base_params, pages, per_page)
+
+    async def search_by_url(
+        self, base_url: str, pages: int = 4, per_page: int = 50,
+        order_by: str = "publication_time",
+    ) -> list[dict]:
+        """Search vacancies from an arbitrary hh.ru search URL.
+
+        Built for the résumé-based "similar vacancies" search
+        (`/search/vacancy?resume=<hash>`): hh matches against the WHOLE
+        résumé instead of a single keyword, which is far less noisy than
+        the keyword filters. Whatever query params are baked into
+        `base_url` (work_format, salary, area, multi-valued search_field, ...)
+        are preserved; `order_by` (default publication_time = freshest first)
+        is set/overridden here, and `per_page`/`page` are managed by
+        pagination.
+
+        Requires a logged-in session — a résumé search is account-bound.
+        """
+        parsed = urlparse(base_url)
+        # parse_qsl returns a LIST of pairs (not a dict) — this preserves
+        # REPEATED keys. The résumé search uses search_field=name&
+        # search_field=company_name&search_field=description; dict() would
+        # collapse those to just the last one and silently narrow the search.
+        pairs = parse_qsl(parsed.query, keep_blank_values=False)
+        # ordering + pagination are ours — drop any baked-in copies so they
+        # don't end up duplicated, then set order_by (freshest first).
+        base_params = [
+            (k, v) for (k, v) in pairs
+            if k not in ("page", "per_page", "order_by")
+        ]
+        base_params.append(("order_by", order_by))
+        scheme = parsed.scheme or "https"
+        netloc = parsed.netloc or "hh.ru"
+        path = parsed.path or "/search/vacancy"
+        search_base = f"{scheme}://{netloc}{path}"
+        return await self._paginate_search(search_base, base_params, pages, per_page)
+
+    async def _paginate_search(
+        self, search_base: str, base_params: list, pages: int, per_page: int
+    ) -> list[dict]:
+        """Paginate an hh.ru vacancy SERP and collect parsed cards.
+
+        `search_base` is scheme://host/path (no query); `base_params` is a
+        LIST of (key, value) pairs (repeated keys allowed — e.g. multi-valued
+        search_field), WITHOUT page/per_page (set here). Iterates
+        page=0..pages-1, parses each card via `_parse_card`, dedups by id,
+        and stops early when a page yields no cards or no NEW cards (end of
+        results / repeated page). Shared by `search_vacancies` (filter-
+        driven) and `search_by_url` (résumé / raw-URL driven).
+        """
+        base = [(k, v) for (k, v) in base_params if k not in ("page", "per_page")]
+        base.append(("per_page", str(per_page)))
         vacancies: list[dict] = []
         seen_ids: set[str] = set()
 
+        page_idx = 0
         for page_idx in range(pages):
-            params = {**base_params, "page": str(page_idx)}
-            url = f"{SEARCH_URL}?{urlencode(params)}"
+            params = base + [("page", str(page_idx))]
+            url = f"{search_base}?{urlencode(params)}"
             logger.info("Searching (page %d): %s", page_idx, url)
 
             try:
@@ -524,7 +586,29 @@ class HHClient:
             except Exception as e:
                 logger.warning("goto failed on page %d: %s", page_idx, e)
                 break
-            await asyncio.sleep(2.5)
+            # Employer names are JS-hydrated AFTER domcontentloaded: the
+            # employer element exists immediately but EMPTY, then its text is
+            # filled in. A fixed sleep raced this on the (slow) proxy, so the
+            # card parse grabbed an empty company most of the time — which
+            # silently disabled the company blacklist and cross-post dedup.
+            # Wait until the employer text is actually populated on most cards.
+            try:
+                await self.page.wait_for_function(
+                    """() => {
+                        const els = document.querySelectorAll(
+                            '[data-qa="vacancy-serp__vacancy-employer"]');
+                        if (!els.length) return false;
+                        let filled = 0;
+                        els.forEach(e => {
+                            if ((e.textContent || '').trim()) filled++;
+                        });
+                        return filled >= Math.max(1, Math.floor(els.length * 0.6));
+                    }""",
+                    timeout=8000,
+                )
+            except Exception:
+                pass
+            await asyncio.sleep(1.0)
 
             cards = await self.page.query_selector_all(
                 '[data-qa="vacancy-serp__vacancy"], '
@@ -576,11 +660,25 @@ class HHClient:
         if not vacancy_id:
             return None
 
-        company_el = await card.query_selector(
-            '[data-qa="vacancy-serp__vacancy-employer"], '
-            '[class*="company-name"]'
-        )
-        company = (await company_el.inner_text()).strip() if company_el else ""
+        # Employer name. The data-qa moved to ...-employer-text on the
+        # current SERP; the old `[class*="company-name"]` matches a now-empty
+        # node. Try the text node first, then the container/link, and fall
+        # back to text_content (inner_text can return "" with stylesheets
+        # blocked). _paginate_search already waits for this to hydrate.
+        company = ""
+        for sel in (
+            '[data-qa="vacancy-serp__vacancy-employer-text"]',
+            '[data-qa="vacancy-serp__vacancy-employer"]',
+            'a[href*="/employer/"]',
+        ):
+            company_el = await card.query_selector(sel)
+            if not company_el:
+                continue
+            company = (await company_el.inner_text()).strip() or (
+                await company_el.text_content() or ""
+            ).strip()
+            if company:
+                break
 
         # Only the exact data-qa selector — the loose `[class*="compensation"]`
         # fallback used to grab the experience-label container instead.
@@ -644,7 +742,6 @@ class HHClient:
           hh.ru/vacancy/123456789/
         Returns None if the URL doesn't look like a vacancy link.
         """
-        import re
         m = re.search(r"hh\.ru/vacancy/(\d+)", url)
         return m.group(1) if m else None
 
@@ -737,7 +834,6 @@ class HHClient:
 
         Returns None when no rating widget is found (new / small company).
         """
-        import re
 
         # 1) try common data-qa selectors
         for sel in [
@@ -805,7 +901,6 @@ class HHClient:
         you're done with the vacancy. Returns None if no rating widget
         present on the company page.
         """
-        import re
 
         url = f"{BASE_URL}/employer/{employer_id}"
         try:
@@ -934,12 +1029,12 @@ class HHClient:
         return False
 
     async def _dismiss_popups(self):
-        """Dismiss subscription / notification popups that may appear."""
-        # "Не сейчас" / "Закрыть" type buttons
+        """Dismiss subscription / similar-vacancies popups that may cover the
+        response form. Deliberately does NOT click generic "Закрыть" /
+        bloko-modal-close — those also match the response modal's own close
+        button and would shut the apply form."""
         for sel in [
             'button:has-text("Не сейчас")',
-            'button:has-text("Закрыть")',
-            '[data-qa="bloko-modal-close"]',
             '[data-qa="vacancy-response-similar-vacancies-close"]',
         ]:
             try:
@@ -951,7 +1046,159 @@ class HHClient:
             except Exception:
                 pass
 
-    async def apply_to_vacancy(self, vacancy_id: str, cover_letter: str = "") -> bool:
+    async def _select_resume(
+        self, resume_hash: str | None, resume_title: str | None = None
+    ) -> bool:
+        """Pick the routed résumé in the open hh response modal and CONFIRM it.
+
+        hh's Magritte modal shows the selected résumé as a clickable card
+        (data-qa="resume-title"); clicking it expands an inline list where each
+        résumé OPTION card carries data-magritte-select-option="<resume hash>"
+        plus a data-qa="resume-title" child. Picking one collapses the list back
+        to the chosen title.
+
+        Matches by HASH first — the resume= hash from the variant's feed URL,
+        which is immune to the user renaming a résumé's title on hh — and falls
+        back to the visible title. Verification compares the collapsed header
+        against the chosen option's OWN live title, so it holds even if
+        feeds.yaml's title has drifted.
+
+        Returns True ONLY when hh confirms the chosen résumé is selected;
+        returns False — never raises — when the picker is absent or nothing
+        matches, so the caller can refuse to send with the wrong (default)
+        résumé.
+        """
+        if not resume_hash and not resume_title:
+            return False
+
+        def _norm(s: str) -> str:
+            return re.sub(r"\s+", " ", (s or "")).strip().lower()
+
+        title_target = _norm(resume_title)
+        label = resume_hash or resume_title
+
+        async def _selected() -> str:
+            el = await self.page.query_selector('[data-qa="resume-title"]')
+            if not el:
+                return ""
+            try:
+                return _norm(await el.inner_text())
+            except Exception:
+                return ""
+
+        async def _card_title(card) -> str:
+            try:
+                t = await card.query_selector('[data-qa="resume-title"]')
+                return _norm(await (t or card).inner_text())
+            except Exception:
+                return ""
+
+        try:
+            # hh's default may already be the routed résumé. Title-only check
+            # (the collapsed header carries no hash); harmless if the title has
+            # drifted - we just fall through and select by hash below.
+            if title_target and await _selected() == title_target:
+                logger.info("Apply: résumé already selected (%s)", label)
+                return True
+
+            header = await self.page.query_selector('[data-qa="resume-title"]')
+            if not header:
+                logger.warning(
+                    "Apply: no résumé picker in the modal - cannot select %s", label
+                )
+                return False
+
+            # Expand the inline résumé list; wait for the option cards to mount.
+            await header.click()
+            cards = []
+            for _ in range(8):  # ~4s
+                await asyncio.sleep(0.5)
+                cards = await self.page.query_selector_all(
+                    '[data-magritte-select-option]'
+                )
+                if cards:
+                    break
+
+            chosen = None
+            # Primary: exact résumé hash on the option card (rename-proof).
+            if resume_hash:
+                chosen = await self.page.query_selector(
+                    f'[data-magritte-select-option="{resume_hash}"]'
+                )
+            # Fallback 1: title match among the hash-bearing option cards.
+            if chosen is None and title_target and cards:
+                for c in cards:
+                    ct = await _card_title(c)
+                    if ct and (ct == title_target or title_target in ct or ct in title_target):
+                        chosen = c
+                        break
+            # Fallback 2: older layout without select-option attrs - match the
+            # résumé-title cards directly.
+            if chosen is None and title_target and not cards:
+                for c in await self.page.query_selector_all('[data-qa="resume-title"]'):
+                    ct = _norm(await c.inner_text())
+                    if ct and (ct == title_target or title_target in ct or ct in title_target):
+                        chosen = c
+                        break
+
+            if chosen is None:
+                avail = []
+                for c in cards:
+                    h = await c.get_attribute("data-magritte-select-option")
+                    avail.append((h, await _card_title(c)))
+                logger.warning(
+                    "Apply: résumé %s not in picker. Available: %s", label, avail
+                )
+                return False
+
+            # The chosen option's OWN live title is the expected post-select
+            # header text (rename-proof verification).
+            expected = await _card_title(chosen)
+            await chosen.click()
+            for _ in range(8):  # ~4s
+                await asyncio.sleep(0.5)
+                if expected and await _selected() == expected:
+                    logger.info("Apply: selected résumé %s (%r)", label, expected)
+                    return True
+
+            logger.warning(
+                "Apply: clicked résumé %s but hh shows %r selected - not confirmed",
+                label, await _selected(),
+            )
+            return False
+        except Exception as e:
+            logger.warning("Apply: résumé selection failed (%s)", e)
+            return False
+
+    async def apply_to_vacancy(
+        self, vacancy_id: str, cover_letter: str = "",
+        resume_identifier: str | None = None, resume_hash: str | None = None,
+    ) -> bool:
+        """Apply to a vacancy. Loads the page with FULL assets (CSS/JS/fonts):
+        hh renders the response form (letter textarea) client-side via its
+        Magritte components, which DON'T mount when stylesheets are aborted.
+        Asset-blocking stays on for search (bandwidth); only apply needs the
+        full page — it's rare and user-triggered, so the extra bytes are fine.
+
+        `resume_hash` (preferred — the resume= hash from the variant's feed URL)
+        and `resume_identifier` (visible-title fallback) select the routed
+        résumé in the response modal's picker. When either is set, the apply
+        FAILS CLOSED if that résumé can't be confirmed selected — it never sends
+        with hh's default. Both None leaves hh's default (legacy single-résumé /
+        unconfigured-feeds path).
+        """
+        self._apply_mode = True
+        try:
+            return await self._apply_to_vacancy_impl(
+                vacancy_id, cover_letter, resume_identifier, resume_hash,
+            )
+        finally:
+            self._apply_mode = False
+
+    async def _apply_to_vacancy_impl(
+        self, vacancy_id: str, cover_letter: str = "",
+        resume_identifier: str | None = None, resume_hash: str | None = None,
+    ) -> bool:
         """Apply to a vacancy with cover letter. Returns True if successful."""
         url = f"{BASE_URL}/vacancy/{vacancy_id}"
         # The HH proxy occasionally stalls a navigation past the timeout. A
@@ -995,15 +1242,26 @@ class HHClient:
             await asyncio.sleep(2)
             logger.info("Confirmed relocation warning for %s", vacancy_id)
 
-        # Step 2: dismiss any other popups (subscription, similar vacancies, etc.)
-        await self._dismiss_popups()
-        await asyncio.sleep(1)
+        # Step 1.5: pick the routed résumé in the modal's résumé selector
+        # (before filling the letter — switching résumé can reset the form).
+        # FAIL-CLOSED: if the routed résumé can't be confirmed selected, ABORT
+        # rather than silently send with hh's default. Sending the wrong résumé
+        # defeats the whole point of multi-résumé routing. Better a reported
+        # failure the user can retry than a wrong-résumé send.
+        if resume_hash or resume_identifier:
+            if not await self._select_resume(resume_hash, resume_identifier):
+                logger.warning(
+                    "Apply ABORTED for %s: résumé %s not selected - refusing to "
+                    "apply with the wrong résumé.",
+                    vacancy_id, resume_hash or resume_identifier,
+                )
+                return False
 
-        # Step 3: find letter textarea — may appear on dedicated page or modal
-        letter_area = None
-        if cover_letter:
-            for attempt in range(6):
-                letter_area = await self.page.query_selector(
+        # Helper: poll for the letter textarea, revealing it via the
+        # "Сопроводительное" toggle if hidden.
+        async def _find_letter_area(seconds: int):
+            for _ in range(seconds):
+                area = await self.page.query_selector(
                     'textarea[data-qa="vacancy-response-popup-form-letter-input"], '
                     'textarea[name="letter"], '
                     'textarea[name="text"], '
@@ -1011,11 +1269,8 @@ class HHClient:
                     'textarea[placeholder*="опроводитель"], '
                     'textarea'
                 )
-                if letter_area and await letter_area.is_visible():
-                    break
-                letter_area = None
-
-                # maybe need to click "add cover letter" toggle
+                if area and await area.is_visible():
+                    return area
                 toggle = await self.page.query_selector(
                     '[data-qa="vacancy-response-letter-toggle"], '
                     'button:has-text("Сопроводительное"), '
@@ -1023,9 +1278,21 @@ class HHClient:
                 )
                 if toggle and await toggle.is_visible():
                     await toggle.click()
-                    await asyncio.sleep(1)
-
                 await asyncio.sleep(1)
+            return None
+
+        # Step 2: find the letter textarea. CRITICAL ordering — look for the
+        # form FIRST (the response modal opens right after the click). Only if
+        # it's missing do we dismiss a possibly-covering popup, then look again.
+        # Dismissing BEFORE finding the form closed the response modal itself
+        # (its close button matches generic "Закрыть").
+        letter_area = None
+        if cover_letter:
+            letter_area = await _find_letter_area(10)
+            if not letter_area:
+                await self._dismiss_popups()
+                await asyncio.sleep(1)
+                letter_area = await _find_letter_area(6)
 
             if letter_area:
                 try:

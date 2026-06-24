@@ -28,9 +28,7 @@ from aiogram import Bot
 from db.models import get_connection
 from config import TELEGRAM_BOT_TOKEN, TELEGRAM_ADMIN_ID
 from bot.autopilot import (
-    profile_overlap_score,
-    _title_looks_like_ic_role,
-    PROFILE_OVERLAP_THRESHOLD,
+    profile_rescue,
     COMPANY_BLACKLIST,
     TITLE_BLACKLIST,
 )
@@ -45,8 +43,9 @@ logger = logging.getLogger("overlap_rescue")
 # Tunables
 DAYS_BACK = 14
 MIN_SCORE = 5
-MAX_SCORE = 29   # don't pull score 30+: those will surface via the normal
-                 # autopilot manual-review band; this is purely the rescue path
+MAX_SCORE = 39   # below the live floor SCORE_AUTO_SKIP=40 — the below-floor
+                 # band the autopilot would rescue; 40+ surfaces via the
+                 # normal manual-review band already, so it's excluded here
 MAX_SEND = 50    # safety cap per run — don't flood Telegram
 SEND_PAUSE_S = 1.5  # gentle pacing for Telegram API
 
@@ -103,9 +102,7 @@ async def main() -> None:
     bot = Bot(token=TELEGRAM_BOT_TOKEN)
     sent = 0
     skipped_blocked = 0
-    skipped_no_overlap = 0
-    skipped_ic = 0
-    skipped_no_role = 0
+    skipped_not_eligible = 0
 
     try:
         for v in cands:
@@ -118,28 +115,19 @@ async def main() -> None:
                 skipped_blocked += 1
                 continue
 
-            score, cats = profile_overlap_score(
+            eligible, score, cats = profile_rescue(
                 v.get("description") or "", v.get("title") or ""
             )
-            if score < PROFILE_OVERLAP_THRESHOLD:
-                skipped_no_overlap += 1
-                continue
-
-            role_match = "product/pm" in cats or "web/agency stack" in cats
-            if not role_match:
-                skipped_no_role += 1
-                continue
-
-            if _title_looks_like_ic_role(v.get("title") or ""):
-                skipped_ic += 1
+            if not eligible:
+                skipped_not_eligible += 1
                 continue
 
             # Eligible — push to Telegram. Lead with the rescue signal
             # (overlap categories) rather than the analyzer's low score:
             # in rescue cards the score is LOW BY DESIGN (the analyzer cut
-            # the role), and we override because overlap-markers match the
-            # candidate's profile. Showing the low score first reads as
-            # "skip this", so the overlap signal leads instead.
+            # the role by role-type gate), and we override because overlap
+            # markers match the configured profile. Showing the low score
+            # first reads as "skip this", so the overlap signal leads instead.
             rating_str = (
                 f"Рейтинг компании: {v.get('company_rating'):.1f}/5\n"
                 if v.get("company_rating") else ""
@@ -174,8 +162,8 @@ async def main() -> None:
         await bot.session.close()
 
     logger.info(
-        "Done. sent=%d  skipped: blocked=%d, no_overlap=%d, ic=%d, no_role=%d",
-        sent, skipped_blocked, skipped_no_overlap, skipped_ic, skipped_no_role,
+        "Done. sent=%d  skipped: blocked=%d, not_eligible=%d",
+        sent, skipped_blocked, skipped_not_eligible,
     )
 
 

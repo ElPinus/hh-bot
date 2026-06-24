@@ -7,7 +7,12 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 
 from config import TELEGRAM_ADMIN_ID
-from bot.keyboards import vacancy_keyboard, cover_letter_keyboard, tg_draft_keyboard
+from bot.keyboards import (
+    vacancy_keyboard,
+    cover_letter_keyboard,
+    tg_draft_keyboard,
+    variants_keyboard,
+)
 from db.storage import (
     save_vacancy,
     save_response,
@@ -17,11 +22,16 @@ from db.storage import (
     get_active_filters,
     get_unscored_vacancies,
     update_vacancy_relevance,
+    set_vacancy_variant,
+    get_vacancy_variant,
     log_action,
 )
+from ai.resume_variants import variant_label
+from ai.resume_feeds import apply_resume_for, apply_resume_hash_for
 from parser.hh_client import HHClient
 from ai.analyzer import analyze_relevance
 from ai.cover_letter import generate_cover_letter, edit_letter
+from ai.variant_router import select_resume_variant
 
 logger = logging.getLogger(__name__)
 router = Router()
@@ -424,6 +434,12 @@ async def on_vacancy_link(message: Message):
         vacancy.setdefault("relevance", "unknown")
         vacancy.setdefault("reason", "анализ не удался")
 
+    # Route to the best-fitting résumé variant (a pasted link has no source
+    # feed, so this is pure semantic). Stored so the letter register and the
+    # apply-modal résumé selection both honour it.
+    variant_key, _vr = await select_resume_variant(vacancy)
+    vacancy["resume_variant"] = variant_key
+
     save_vacancy(vacancy)
 
     score = vacancy.get("relevance_score", 0)
@@ -436,6 +452,7 @@ async def on_vacancy_link(message: Message):
         f"Зарплата: {vacancy.get('salary') or 'не указана'}\n"
         f"Город: {vacancy.get('city', '')}\n"
         f"Релевантность: {score}/100\n"
+        f"Резюме: {variant_label(variant_key)}\n"
         f"Причина: {vacancy.get('reason', '')}\n\n"
         "Генерирую сопроводительное..."
     )
@@ -553,9 +570,18 @@ async def cb_send(callback: CallbackQuery):
     # the lock so a manual "Send" can't clobber an in-flight autopilot
     # navigation (or vice versa).
     from bot.autopilot import HH_LOCK
+    # Apply with the routed résumé variant (hash preferred, title fallback;
+    # both None -> hh default). apply_to_vacancy fails closed if it can't
+    # confirm the résumé, so a wrong-résumé send is impossible.
+    variant = (data.get("vacancy") or {}).get("resume_variant")
+    resume_identifier = apply_resume_for(variant)
+    resume_hash = apply_resume_hash_for(variant)
     async with HH_LOCK:
         try:
-            success = await hh_client.apply_to_vacancy(vacancy_id, data["letter"])
+            success = await hh_client.apply_to_vacancy(
+                vacancy_id, data["letter"],
+                resume_identifier=resume_identifier, resume_hash=resume_hash,
+            )
         except Exception:
             # apply_to_vacancy is meant to return a bool, but a browser/proxy
             # error (e.g. navigation timeout) can still raise. Swallow it to a
@@ -579,10 +605,17 @@ async def cb_send(callback: CallbackQuery):
     else:
         # Keep the cards visible so the user can see what failed.
         await _delete_silent(callback.bot, callback.message.chat.id, progress.message_id)
+        # Always include the vacancy title + link so the user knows WHICH one
+        # failed — this note can land far below the original card in the chat.
+        vac = data.get("vacancy") or {}
+        title = vac.get("title") or "вакансию"
+        url = vac.get("url") or f"https://hh.ru/vacancy/{vacancy_id}"
         await callback.message.answer(
-            "Не удалось отправить отклик. Скорее всего нужен доп-шаг (вопросы "
-            "работодателя / внешняя форма / релокация) - откликнись вручную. "
-            "Либо ты уже откликался или вакансия закрыта."
+            f"⚠️ Не удалось отправить отклик: {title}\n"
+            f"{url}\n\n"
+            "Скорее всего нужен доп-шаг (вопросы работодателя / внешняя форма / "
+            "релокация) — откликнись вручную. Либо ты уже откликался или "
+            "вакансия закрыта."
         )
 
 
@@ -719,6 +752,63 @@ async def cb_cancel(callback: CallbackQuery):
     ):
         if mid:
             await _delete_silent(callback.bot, chat_id, mid)
+    await callback.answer()
+
+
+# --- Résumé-variant override (the card's "Сменить резюме" button) ---
+# varmenu -> show the variant menu; setvar -> store the pick + restore the
+# card with the updated label; varback -> restore the card unchanged. The
+# stored variant drives the letter register (cb_apply reads the DB row) and the
+# résumé picked in the apply modal. hh vacancy ids are colon-free, so
+# setvar:{vid}:{key} splits cleanly with rsplit.
+
+
+@router.callback_query(F.data.startswith("varmenu:"))
+async def cb_varmenu(callback: CallbackQuery):
+    if not _is_admin(callback.from_user.id):
+        return
+    vacancy_id = callback.data.split(":", 1)[1]
+    current = get_vacancy_variant(vacancy_id)
+    await callback.message.edit_reply_markup(
+        reply_markup=variants_keyboard(vacancy_id, current)
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("setvar:"))
+async def cb_setvar(callback: CallbackQuery):
+    if not _is_admin(callback.from_user.id):
+        return
+    # data = "setvar:{vid}:{key}". hh ids carry no colons, so the LAST colon
+    # splits off the variant key and leaves the id intact.
+    rest = callback.data.split(":", 1)[1]
+    vacancy_id, key = rest.rsplit(":", 1)
+    set_vacancy_variant(vacancy_id, key)
+    vac = _load_vacancy(vacancy_id)
+    url = (vac or {}).get("url") or f"https://hh.ru/vacancy/{vacancy_id}"
+    # Keep a pending draft's vacancy dict in sync so a later "Переписать" uses
+    # the new register without a stale DB re-read.
+    pending = pending_letters.get(vacancy_id)
+    if pending and isinstance(pending.get("vacancy"), dict):
+        pending["vacancy"]["resume_variant"] = key
+    await callback.message.edit_reply_markup(
+        reply_markup=vacancy_keyboard(vacancy_id, url, key)
+    )
+    await callback.answer(f"Резюме: {variant_label(key)}")
+    log_action("variant_override", f"vacancy={vacancy_id} variant={key}")
+
+
+@router.callback_query(F.data.startswith("varback:"))
+async def cb_varback(callback: CallbackQuery):
+    if not _is_admin(callback.from_user.id):
+        return
+    vacancy_id = callback.data.split(":", 1)[1]
+    vac = _load_vacancy(vacancy_id)
+    url = (vac or {}).get("url") or f"https://hh.ru/vacancy/{vacancy_id}"
+    current = (vac or {}).get("resume_variant")
+    await callback.message.edit_reply_markup(
+        reply_markup=vacancy_keyboard(vacancy_id, url, current)
+    )
     await callback.answer()
 
 

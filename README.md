@@ -28,6 +28,12 @@ LLM-based relevance scoring and auto-generated cover letters.
 - **Cover letter** generation uses your `prompts/candidate.txt` profile,
   goes through an adversarial self-critique pass (regenerates on
   fabricated numbers / HR clichés / off-tone phrasing).
+- **Multiple résumés** (optional): keep several targeted hh.ru résumés (one
+  identity each — e.g. Product / Engineering / Project) and the bot routes
+  each vacancy to the best-fitting one, writes the cover letter in that
+  résumé's register, and selects it in the apply modal. Define the variants in
+  `ai/resume_variants.py` and their search feeds in `resume-variants/feeds.yaml`
+  (see the `.example`). Unconfigured, it runs with hh.ru's default single résumé.
 - **Apply by link**: paste an hh.ru vacancy URL into the Telegram chat
   and the bot fetches it, scores it, drafts a cover letter, and shows
   it with Send / Rewrite / Cancel buttons — no need to wait for the
@@ -168,22 +174,30 @@ hh-bot/
 │   │                             #   profile-driven; tunable in-file)
 │   ├── vacancy_analyzer.py       # Deep structured JD analysis for
 │   │                             #   cover-letter targeting
-│   └── cover_letter.py           # Cover letter generation + adversarial
-│                                 #   self-critique
+│   ├── cover_letter.py           # Cover letter generation + adversarial
+│   │                             #   self-critique
+│   ├── resume_variants.py        # Multi-résumé registry (identities +
+│   │                             #   letter registers; edit to your own)
+│   ├── variant_router.py         # Routes a vacancy to the best résumé
+│   └── resume_feeds.py           # Loads per-variant feed config (yaml)
 ├── bot/
 │   ├── handlers.py               # Telegram commands and callbacks
 │   ├── autopilot.py              # Background search + filter + apply loop
 │   ├── messages_loop.py          # hh.ru negotiations inbox monitor
+│   ├── tg_loop.py                # Telegram channel monitor loop
 │   └── keyboards.py              # Inline keyboards
 ├── parser/
 │   ├── hh_client.py              # Playwright client for hh.ru
 │   └── tg_client.py              # Reads TG channels via t.me/s/ web mirror
 ├── scripts/
-│   └── tg_pull_test.py           # Manual smoke test for TG channel parser
+│   ├── tg_pull_test.py           # Manual smoke test for TG channel parser
+│   └── overlap_rescue_existing.py  # Retroactive profile-overlap rescue
 ├── prompts/
 │   ├── candidate.example.txt     # Template — copy to candidate.txt
 │   ├── analyzer_summary.example.txt
 │   └── candidate.txt             # YOUR private profile (gitignored)
+├── resume-variants/
+│   └── feeds.example.yaml        # Template per-variant feed config
 ├── data/
 │   └── tg_channels.example.yaml  # Template TG channel list
 └── db/

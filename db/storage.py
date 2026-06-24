@@ -68,8 +68,8 @@ def save_vacancy(vacancy: dict) -> bool:
     try:
         conn.execute(
             """INSERT OR IGNORE INTO vacancies
-               (id, title, company, salary, city, url, description, relevance, relevance_score, company_rating, source)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               (id, title, company, salary, city, url, description, relevance, relevance_score, company_rating, source, resume_variant)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 vacancy["id"],
                 vacancy["title"],
@@ -82,10 +82,31 @@ def save_vacancy(vacancy: dict) -> bool:
                 vacancy.get("relevance_score", 0),
                 vacancy.get("company_rating", 0) or 0,
                 vacancy.get("source", "hh"),
+                vacancy.get("resume_variant"),
             ),
         )
         conn.commit()
         return conn.total_changes > 0
+    finally:
+        conn.close()
+
+
+def vacancy_exists(vacancy_id: str) -> bool:
+    """True if this vacancy was already saved (examined) in a past cycle.
+
+    The autopilot uses this to skip re-fetching + re-analyzing vacancies it
+    has already processed: the resume search re-returns the same freshest
+    vacancies every cycle, so without an early skip each one would be opened
+    (proxy goto) and scored (LLM call) again — at a short cadence that would
+    flood the LLM and trip hh.ru's anti-bot on the proxy IP. New vacancies
+    (not yet in the table) fall through and get processed.
+    """
+    conn = get_connection()
+    try:
+        row = conn.execute(
+            "SELECT 1 FROM vacancies WHERE id = ?", (vacancy_id,)
+        ).fetchone()
+        return row is not None
     finally:
         conn.close()
 
@@ -195,6 +216,33 @@ def update_vacancy_relevance(vacancy_id: str, relevance: str, score: int, reason
             (relevance, score, vacancy_id),
         )
         conn.commit()
+    finally:
+        conn.close()
+
+
+def set_vacancy_variant(vacancy_id: str, variant: str) -> None:
+    """Store the résumé variant routed (or manually overridden) for a vacancy.
+    The cover-letter register and the apply-modal résumé selection both honour
+    this value."""
+    conn = get_connection()
+    try:
+        conn.execute(
+            "UPDATE vacancies SET resume_variant = ? WHERE id = ?",
+            (variant, vacancy_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_vacancy_variant(vacancy_id: str) -> str | None:
+    """Return the stored resume_variant for a vacancy, or None if unset."""
+    conn = get_connection()
+    try:
+        row = conn.execute(
+            "SELECT resume_variant FROM vacancies WHERE id = ?", (vacancy_id,)
+        ).fetchone()
+        return row["resume_variant"] if row else None
     finally:
         conn.close()
 

@@ -11,6 +11,7 @@ secrets/
 hh_cookies.json
 *cookies*.json
 *session*.json
+*.session
 state.json
 
 # Logs
@@ -36,6 +37,12 @@ resume*.docx
 prompts/candidate.txt
 prompts/analyzer_summary.txt
 prompts/*.local.txt
+
+# Per-variant résumé feed config (semi-personal — feed_url carries your
+# résumé hashes, apply_resume your résumé titles). Only the .example
+# template is committed; your real resume-variants/feeds.yaml stays local.
+resume-variants/*
+!resume-variants/*.example.yaml
 
 # LinkedIn drafts and other personal markdown
 linkedin-*.md

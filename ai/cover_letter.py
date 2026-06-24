@@ -16,6 +16,7 @@ import json
 
 from ai.llm_client import llm_chat
 from ai.vacancy_analyzer import analyze_vacancy_deep
+from ai.resume_variants import register_block, normalize_key
 from config import CANDIDATE_NAME
 
 logger = logging.getLogger(__name__)
@@ -312,34 +313,7 @@ as-is, целиком, без редактирования.
 - Закрытие — коротко и по-человечески: «готов обсудить подробнее» /
   «готов созвониться». Без пафоса и без оборотов про «темп / формат / режим».
 
-============================================================
-РЕГИСТР — ПРОДУКТОВЫЙ, НЕ ИНЖЕНЕРНЫЙ
-============================================================
-
-Определи РЕГИСТР письма по роли кандидата (см. профайл ниже). Для
-продуктовых / внедренческих / управленческих ролей (Product / Implementation /
-Project / Lead) письмо должно звучать как от человека, который мыслит
-бизнес-результатом, а НЕ отчитывается о реализации; технический бэкграунд
-(если он есть в профайле) ПОДТВЕРЖДАЕТ глубину одним-двумя штрихами, а НЕ
-составляет тело письма. Для чисто инженерных ролей — см. ИСКЛЮЧЕНИЕ ниже.
-
-- Веди РЕЗУЛЬТАТОМ и ЦЕННОСТЬЮ, а не реализацией:
-  * по-инженерному (НЕ как основа письма): «перечень протоколов, фреймворков
-    и деталей реализации — очереди, webhooks, схемы БД, конфиги, деплой»
-  * по-продуктовому (ТАК): «сократил стоимость операции кратно и вывел сервис
-    в окупаемость; модели и решения меняю под баланс качество / цена / скорость
-    без простоя сервиса»
-- Технику давай ОБЩО и подчинённо результату: «сам провожу от продуктовой
-  гипотезы до прод-эксплуатации» вместо перечня протоколов, языков и БД.
-  Один технический штрих для глубины — ок; перечисление стека — нет.
-- Продуктовый словарь: гипотеза, метрика, baseline, time-to-market,
-  unit-экономика, окупаемость, приоритизация, эффект на бизнес, ценность для
-  пользователя. НО без пустого buzz: каждое продуктовое утверждение
-  подкреплено конкретикой/цифрой из профайла, иначе это вода.
-- ИСКЛЮЧЕНИЕ — чисто инженерная вакансия (AI / Backend Engineer без
-  PM-ответственности): там стек уместен и ожидаем, регистр сдвигай к
-  инженерному — но всё равно через «какой эффект давала технология», а не
-  только «что и как сделано».
+{register_block}
 
 ============================================================
 ПО-ЧЕЛОВЕЧЕСКИ, БЕЗ ИИ-ШТАМПОВ (это сейчас главная причина отказов)
@@ -548,12 +522,16 @@ React, TypeScript, REST API, GraphQL, gRPC."
 """
 
 
-def _build_system_prompt() -> str:
+def _build_system_prompt(variant: str | None = None) -> str:
     candidate_context = _load_candidate_context()
     first_name = CANDIDATE_NAME or "[CANDIDATE_NAME not set]"
-    return _SYSTEM_PROMPT_SCAFFOLD.replace(
-        "{candidate_context}", candidate_context
-    ).replace("{first_name}", first_name)
+    # Inject the variant's register block first (it carries no further
+    # placeholders), then the candidate profile, then the signature name.
+    return (
+        _SYSTEM_PROMPT_SCAFFOLD.replace("{register_block}", register_block(variant))
+        .replace("{candidate_context}", candidate_context)
+        .replace("{first_name}", first_name)
+    )
 
 
 def _format_analysis_for_drafter(analysis: dict) -> str:
@@ -826,8 +804,14 @@ async def _critique_letter(letter: str, analysis: dict) -> dict:
         return {"verdict": "OK", "issues": [], "fix_instructions": ""}
 
 
-async def _draft_letter(vacancy: dict, analysis: dict, extra_fix: str = "") -> str:
-    """Inner drafter — generates one letter attempt given analysis."""
+async def _draft_letter(
+    vacancy: dict, analysis: dict, extra_fix: str = "", variant: str | None = None
+) -> str:
+    """Inner drafter — generates one letter attempt given analysis.
+
+    `variant` selects the résumé register (see ai/resume_variants); None falls
+    back to the default variant inside _build_system_prompt.
+    """
     title = vacancy.get("title", "")
     company = vacancy.get("company", "")
     description = vacancy.get("description", "")
@@ -861,7 +845,7 @@ async def _draft_letter(vacancy: dict, analysis: dict, extra_fix: str = "") -> s
 
     raw = await llm_chat(
         [
-            {"role": "system", "content": _build_system_prompt()},
+            {"role": "system", "content": _build_system_prompt(variant)},
             {"role": "user", "content": user_prompt},
         ],
         temperature=0.4,
@@ -871,15 +855,23 @@ async def _draft_letter(vacancy: dict, analysis: dict, extra_fix: str = "") -> s
     return _clean_letter(raw)
 
 
-async def generate_cover_letter(vacancy: dict) -> str:
+async def generate_cover_letter(vacancy: dict, variant: str | None = None) -> str:
     """Generate personalized cover letter via two-stage pipeline + self-critique.
 
-    Stage 1: deep structured analysis of vacancy (deepseek-v4-pro thinking).
-    Stage 2: targeted letter using the analysis as a brief (deepseek-v4-pro).
+    Stage 1: deep structured analysis of vacancy.
+    Stage 2: targeted letter using the analysis as a brief.
     Stage 3: self-critique; on REGENERATE — one more draft attempt with feedback.
+
+    `variant` selects the résumé register (see ai/resume_variants). When None it
+    is taken from vacancy["resume_variant"] (the routed choice) and ultimately
+    defaults to DEFAULT_VARIANT inside the registry helpers.
 
     On any failure in stage 1 — falls back to single-stage drafting.
     """
+    if variant is None:
+        variant = vacancy.get("resume_variant")
+    variant = normalize_key(variant)
+
     try:
         analysis = await analyze_vacancy_deep(vacancy)
     except Exception as e:
@@ -887,7 +879,7 @@ async def generate_cover_letter(vacancy: dict) -> str:
         analysis = {}
 
     try:
-        letter = await _draft_letter(vacancy, analysis)
+        letter = await _draft_letter(vacancy, analysis, variant=variant)
     except Exception as e:
         logger.error("LLM cover letter error: %s", e)
         return ""
@@ -909,7 +901,7 @@ async def generate_cover_letter(vacancy: dict) -> str:
             logger.info("Critique requested regenerate, fix: %s", fix_text)
             try:
                 letter2 = await _draft_letter(
-                    vacancy, analysis, extra_fix=fix_text,
+                    vacancy, analysis, extra_fix=fix_text, variant=variant,
                 )
                 if letter2:
                     letter = letter2

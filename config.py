@@ -39,6 +39,46 @@ HH_COOKIES_PATH = BASE_DIR / "hh_cookies.json"
 #   http://host:port  (no auth)
 HH_PROXY = os.getenv("HH_PROXY", "")
 
+# === Resume-based search (primary discovery) ===
+# hh.ru's "similar vacancies for this resume" search matches against your
+# WHOLE resume instead of a keyword, which is far less noisy than the
+# keyword filters. Paste the full hh.ru search URL that carries
+# `?resume=<hash>` (open your resume on hh → "Похожие вакансии"); the bot
+# appends order_by=publication_time (freshest first) + pagination. Any
+# filters you set in that URL on hh (salary, schedule, region) are kept.
+# Empty = disabled. Semi-personal (the hash identifies your resume), so it
+# lives in .env, never in code.
+HH_RESUME_SEARCH_URL = os.getenv("HH_RESUME_SEARCH_URL", "")
+
+# Keyword filters (the `filters` DB table) on/off. Default on for backward
+# compatibility. Set false to run resume-search-only — the keyword queries
+# can be over-constrained (experience + narrow keyword → 0 results) and noisy
+# (a broad "AI"/"ИИ" drags in IC-dev roles). The DB filter rows are
+# preserved either way, so flipping this back on restores them.
+HH_KEYWORD_FILTERS_ENABLED = os.getenv(
+    "HH_KEYWORD_FILTERS_ENABLED", "true",
+).strip().lower() in ("1", "true", "yes", "on")
+
+# Employer-rating skip. When on, the autopilot skips vacancies whose hh
+# company rating is below MIN_COMPANY_RATING (bot/autopilot.py). Default on
+# for backward compatibility; set false when you trust the source's own
+# matching (e.g. the resume search) — the rating scrape is unreliable (it
+# can misread a stray "1.8" off the page and cut good vacancies). The
+# rating is still fetched and shown on the Telegram card either way.
+HH_RATING_FILTER_ENABLED = os.getenv(
+    "HH_RATING_FILTER_ENABLED", "true",
+).strip().lower() in ("1", "true", "yes", "on")
+
+# Per-vacancy remote re-check. When on, the autopilot opens each vacancy and
+# skips it unless the page text shows a remote/hybrid marker. Default on for
+# backward compatibility. Set false when the search URL already constrains
+# the work format (e.g. work_format=REMOTE in HH_RESUME_SEARCH_URL) — the
+# re-check is then redundant AND risks false-negatives (a genuinely-remote
+# vacancy whose page lacks the broad markers would be wrongly skipped).
+HH_REMOTE_CHECK_ENABLED = os.getenv(
+    "HH_REMOTE_CHECK_ENABLED", "true",
+).strip().lower() in ("1", "true", "yes", "on")
+
 # GLM (Zhipu AI)
 GLM_API_KEY = os.getenv("GLM_API_KEY", "")
 GLM_PROXY = os.getenv("GLM_PROXY", "")

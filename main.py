@@ -59,7 +59,12 @@ async def main():
             asyncio.create_task(tg_loop(bot))
 
         logger.info("Starting bot polling...")
-        await dp.start_polling(bot)
+        # drop_pending_updates: discard commands/button-presses that queued
+        # while the bot was DOWN. Without this, a stale /login (or any command)
+        # accumulated during downtime fires on startup — e.g. a queued /login
+        # opened the interactive login browser right after a valid session load
+        # and wedged the autopilot into "not logged in".
+        await dp.start_polling(bot, drop_pending_updates=True)
     finally:
         logger.info("Shutting down: closing hh.ru client and bot session")
         await hh.stop()

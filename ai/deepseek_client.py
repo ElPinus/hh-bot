@@ -22,6 +22,20 @@ PRO_MODEL = "deepseek-v4-pro"
 _last_request_time = 0.0
 MIN_REQUEST_INTERVAL = 1.0  # seconds
 
+# Per-MODEL circuit breaker — pro and flash fail INDEPENDENTLY. Under load the
+# heavy `deepseek-v4-pro` overloads first (the "900-second timeout" error),
+# while `deepseek-v4-flash` stays up. So the breaker is keyed by model name: a
+# pro outage trips ONLY pro and must NOT block the flash fallback (llm_chat
+# tries pro -> flash on the same provider before Groq). Without this a pro
+# outage stalled / failed every cover letter. asyncio is single-threaded, so a
+# plain module dict is race-safe enough here.
+_cooldown_until: dict[str, float] = {}
+COOLDOWN_S = 120.0
+
+
+def _trip_breaker(model_name: str) -> None:
+    _cooldown_until[model_name] = time.time() + COOLDOWN_S
+
 
 async def deepseek_chat(
     messages: list[dict],
@@ -43,6 +57,13 @@ async def deepseek_chat(
     if not DEEPSEEK_API_KEY:
         raise RuntimeError("DEEPSEEK_API_KEY is empty")
 
+    model_name = model or DEFAULT_MODEL
+
+    # Per-model breaker open — THIS model failed recently. Skip it (fast) so the
+    # caller flips to the next model (flash) / provider instead of waiting.
+    if time.time() < _cooldown_until.get(model_name, 0.0):
+        raise RuntimeError(f"DeepSeek {model_name} in cooldown after recent failure")
+
     now = time.time()
     wait_needed = MIN_REQUEST_INTERVAL - (now - _last_request_time)
     if wait_needed > 0:
@@ -53,7 +74,7 @@ async def deepseek_chat(
         "Content-Type": "application/json",
     }
     payload = {
-        "model": model or DEFAULT_MODEL,
+        "model": model_name,
         "messages": messages,
         "temperature": temperature,
         "max_tokens": max_tokens,
@@ -66,19 +87,21 @@ async def deepseek_chat(
     if GLM_PROXY:
         transport = httpx.AsyncHTTPTransport(proxy=GLM_PROXY)
 
-    async with httpx.AsyncClient(transport=transport, timeout=120) as client:
+    async with httpx.AsyncClient(transport=transport, timeout=60) as client:
         for attempt in range(3):
             try:
                 _last_request_time = time.time()
                 resp = await client.post(API_URL, json=payload, headers=headers)
-            except httpx.TimeoutException:
-                logger.warning("DeepSeek timeout (attempt %d/3)", attempt + 1)
-                await asyncio.sleep(10)
-                continue
-            except httpx.HTTPError as e:
-                logger.warning("DeepSeek HTTP error (attempt %d/3): %s", attempt + 1, e)
-                await asyncio.sleep(10)
-                continue
+            except (httpx.TimeoutException, httpx.HTTPError) as e:
+                # Unresponsive endpoint — retrying the same hung server just
+                # stacks more 60s waits. Trip the breaker and fail over to Groq
+                # now (a cover letter makes several calls; don't stall each one).
+                logger.warning(
+                    "DeepSeek %s unreachable (%s) — tripping breaker, failing over",
+                    model_name, type(e).__name__,
+                )
+                _trip_breaker(model_name)
+                raise RuntimeError(f"DeepSeek {model_name} unreachable: {e}")
 
             if resp.status_code == 429:
                 wait = 20 * (attempt + 1)  # 20s, 40s, 60s
@@ -101,7 +124,11 @@ async def deepseek_chat(
             data = resp.json()
 
             if "choices" not in data:
-                logger.error("DeepSeek unexpected response: %s", str(data)[:300])
+                # e.g. the "900-second timeout" error body — DeepSeek is
+                # overloaded. Trip the breaker so the rest of this cover-letter
+                # pipeline skips DeepSeek instead of re-hitting the same wall.
+                logger.error("DeepSeek %s unexpected response: %s", model_name, str(data)[:300])
+                _trip_breaker(model_name)
                 raise RuntimeError(f"DeepSeek unexpected: {str(data)[:200]}")
 
             msg = data["choices"][0]["message"]
@@ -113,6 +140,9 @@ async def deepseek_chat(
             if not content:
                 logger.warning("DeepSeek returned empty content and reasoning")
                 raise RuntimeError("DeepSeek returned empty response")
+            _cooldown_until[model_name] = 0.0  # healthy — clear this model's breaker
             return content
 
+        # 429 / 5xx retries exhausted — cool down this model and fail over.
+        _trip_breaker(model_name)
         raise RuntimeError("DeepSeek API failed after 3 retries")

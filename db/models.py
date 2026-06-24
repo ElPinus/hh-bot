@@ -96,6 +96,11 @@ def init_db():
     # ("name") instead of full text — used to catch AI/ИИ in titles without
     # flooding on description mentions. Empty = hh default (search everywhere).
     _ensure_column(conn, "filters", "search_field", "TEXT DEFAULT ''")
+    # resume_variant records which configured résumé the bot routed this
+    # vacancy to (key matching ai/resume_variants.py). Drives the letter
+    # register and the résumé picked in the apply modal. NULL on pre-existing
+    # rows / when routing hasn't run yet (callers fall back to the default).
+    _ensure_column(conn, "vacancies", "resume_variant", "TEXT")
     conn.close()
 
 

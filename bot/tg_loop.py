@@ -12,10 +12,10 @@ means it is safe to run in MANUAL_MODE — it never takes an external
 action on the user's behalf.
 
 Reuses, rather than duplicates, the autopilot's tuned classification:
-  * _is_blacklisted        — title/company topic gate (off-target roles)
-  * profile_overlap_score  — rescue low-scored posts that overlap the
-                             configured profile
-  * SCORE_AUTO_SKIP        — the manual-review floor
+  * _is_blacklisted  — title/company topic gate (off-target roles)
+  * profile_rescue   — rescue low-scored posts that overlap the configured
+                       profile markers
+  * SCORE_AUTO_SKIP  — the manual-review floor
 """
 from __future__ import annotations
 
@@ -42,11 +42,11 @@ from db.storage import (
 from parser.tg_client import load_channels, fetch_recent_posts
 from ai.tg_extractor import extract_vacancy
 from ai.analyzer import analyze_relevance
+from ai.variant_router import select_resume_variant
 from bot.keyboards import tg_vacancy_keyboard
 from bot.autopilot import (
     SCORE_AUTO_SKIP,
-    PROFILE_OVERLAP_THRESHOLD,
-    profile_overlap_score,
+    profile_rescue,
     _title_looks_like_ic_role,
     _is_blacklisted,
 )
@@ -190,23 +190,24 @@ async def _process_post(bot: Bot, post, stats: dict) -> None:
     # The precise/expensive pro analysis is reserved for the hh autopilot.
     analysis = await analyze_relevance(vacancy, deep=False)
     vacancy.update(analysis)
+
+    # Route to the best-fitting résumé variant so the copy-paste draft uses the
+    # right register (no source feed for a Telegram post -> pure semantic).
+    variant_key, _vr = await select_resume_variant(vacancy)
+    vacancy["resume_variant"] = variant_key
+
     save_vacancy(vacancy)
     stats["vacancies"] += 1
 
     score = vacancy.get("relevance_score", 0)
     overlap_meta = ""
     if score < SCORE_AUTO_SKIP:
-        overlap, matched = profile_overlap_score(vacancy["description"], title)
-        role_match = "product/pm" in matched or "web/agency stack" in matched
-        if (
-            overlap >= PROFILE_OVERLAP_THRESHOLD
-            and role_match
-            and not _title_looks_like_ic_role(title)
-        ):
+        eligible, overlap, matched = profile_rescue(vacancy["description"], title)
+        if eligible:
             overlap_meta = f"[overlap={overlap}] cats: {', '.join(matched)}"
         else:
             stats["skipped"] += 1
-            return  # below floor and no profile overlap — drop silently
+            return  # below floor and not eligible for profile rescue — drop
 
     await _notify_vacancy(bot, vacancy, result, overlap_meta)
     stats["notified"] += 1

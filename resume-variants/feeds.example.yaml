@@ -1,0 +1,45 @@
+# Per-variant feed config for the multi-résumé feature (ai/resume_feeds.py).
+#
+# Copy this file to  resume-variants/feeds.yaml  (gitignored) and fill in your
+# own résumé feed URLs. The KEYS here ("1", "2", "3", ...) must match the keys
+# of RESUME_VARIANTS in ai/resume_variants.py.
+#
+# This file is SEMI-PERSONAL: feed_url carries your résumé hash (?resume=...),
+# which identifies your hh.ru résumé. Keep the real feeds.yaml out of git —
+# only this .example template is committed.
+#
+# To get a feed_url: open one of your résumés on hh.ru -> "Похожие вакансии" ->
+# copy the full search URL from the address bar (it contains ?resume=<hash>).
+#
+# If this file is absent the bot falls back to the single HH_RESUME_SEARCH_URL
+# (or keyword filters) and the multi-résumé routing is simply off.
+
+# Optional: which variant to use when routing can't decide (pasted link, TG
+# post). Defaults to DEFAULT_VARIANT in ai/resume_variants.py.
+default_variant: "1"
+
+variants:
+  "1":
+    enabled: true
+    # Full hh.ru "similar vacancies" search URL for this résumé (carries ?resume=<hash>).
+    feed_url: "https://hh.ru/search/vacancy?resume=PUT_YOUR_RESUME_HASH_HERE&order_by=relevance"
+    # Exact résumé title to pick in the apply modal (optional — leave empty to
+    # use hh's default). The résumé hash from feed_url is preferred over this.
+    apply_resume: "Product Manager"
+  "2":
+    enabled: true
+    feed_url: "https://hh.ru/search/vacancy?resume=ANOTHER_RESUME_HASH&order_by=relevance"
+    apply_resume: "Engineering Lead"
+  "3":
+    enabled: false
+    feed_url: ""
+    apply_resume: "Project Manager"
+
+# Optional: keyword feeds — plain hh text-searches (not résumé-similarity),
+# each attached to a `variant` so the apply-résumé + router hint reuse that
+# variant's config. Useful for a niche cluster whose titles vary too much for
+# résumé-similarity to surface. Remove this section if you don't need it.
+keyword_feeds:
+  - enabled: false
+    variant: "1"
+    feed_url: "https://hh.ru/search/vacancy?text=YOUR+KEYWORDS&order_by=publication_time"

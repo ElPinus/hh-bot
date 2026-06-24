@@ -1,9 +1,15 @@
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
 from config import MANUAL_MODE
+from ai.resume_variants import VARIANT_ORDER, variant_label, normalize_key
 
 
-def vacancy_keyboard(vacancy_id: str, url: str) -> InlineKeyboardMarkup:
+def vacancy_keyboard(
+    vacancy_id: str, url: str, variant_key: str | None = None
+) -> InlineKeyboardMarkup:
+    # 3rd row shows the routed résumé variant and opens the override menu. The
+    # label is always the EFFECTIVE variant (variant_label normalizes None to
+    # the default), so it never lies about which résumé "Откликнуться" will use.
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
@@ -17,8 +23,35 @@ def vacancy_keyboard(vacancy_id: str, url: str) -> InlineKeyboardMarkup:
             [
                 InlineKeyboardButton(text="Открыть на hh.ru", url=url),
             ],
+            [
+                InlineKeyboardButton(
+                    text=f"Резюме: {variant_label(variant_key)} ▸ сменить",
+                    callback_data=f"varmenu:{vacancy_id}",
+                ),
+            ],
         ]
     )
+
+
+def variants_keyboard(
+    vacancy_id: str, current_key: str | None = None
+) -> InlineKeyboardMarkup:
+    """The résumé-override menu: one row per variant (current marked ✓) plus a
+    back button. Picking a row fires setvar:{vid}:{key}; back restores the card."""
+    current = normalize_key(current_key)
+    rows = [
+        [
+            InlineKeyboardButton(
+                text=f"{'✓ ' if k == current else ''}{variant_label(k)}",
+                callback_data=f"setvar:{vacancy_id}:{k}",
+            )
+        ]
+        for k in VARIANT_ORDER
+    ]
+    rows.append(
+        [InlineKeyboardButton(text="← назад", callback_data=f"varback:{vacancy_id}")]
+    )
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def cover_letter_keyboard(vacancy_id: str) -> InlineKeyboardMarkup:
