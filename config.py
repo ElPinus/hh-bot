@@ -89,9 +89,6 @@ DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "")
 # Groq
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
 
-# Resume
-RESUME_FILE = BASE_DIR / os.getenv("RESUME_FILE", "resume.txt")
-
 # === Telegram channel reading ===
 # Channels are read via the credential-free public web mirror
 # (https://t.me/s/<channel>), NOT via Telethon/MTProto. So NO api_id/

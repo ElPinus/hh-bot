@@ -66,6 +66,37 @@ LLM-based relevance scoring and auto-generated cover letters.
 - `python-dotenv` — config
 - `sqlite3` (Python stdlib) — storage
 
+## Quick start
+
+1. **Clone + install**
+   ```bash
+   git clone https://github.com/<YOUR_USERNAME>/hh-bot.git && cd hh-bot
+   python -m venv .venv && source .venv/bin/activate   # Windows: .venv\Scripts\activate
+   pip install -r requirements.txt
+   playwright install chromium
+   ```
+2. **Secrets** — `cp .env.example .env`, then fill `TELEGRAM_BOT_TOKEN`,
+   `TELEGRAM_ADMIN_ID`, `HH_LOGIN`, `DEEPSEEK_API_KEY` (+ optional `GROQ_API_KEY`
+   fallback) and `CANDIDATE_NAME`.
+3. **Your profile** — the two files that drive scoring + letters:
+   ```bash
+   cp prompts/analyzer_summary.example.txt prompts/analyzer_summary.txt  # short summary -> 0-100 score
+   cp prompts/candidate.example.txt        prompts/candidate.txt         # full profile -> cover letters
+   ```
+   Fill both with your real data (they're gitignored, stay on your machine).
+4. **How vacancies are found** (in `.env`): paste your résumé's "Похожие
+   вакансии" URL into `HH_RESUME_SEARCH_URL` (recommended), and/or keep
+   `HH_KEYWORD_FILTERS_ENABLED=true` and add filters via `/addfilter` in Telegram.
+5. **Multiple résumés** (optional) — see the *Multiple résumés* section below.
+6. **Run + log in**
+   ```bash
+   python main.py
+   ```
+   Then send `/login` in Telegram — a browser opens once; log in to hh.ru and
+   the session is saved (headless from then on).
+
+The sections below expand on each step.
+
 ## Installation
 
 ```bash
@@ -104,11 +135,19 @@ GROQ_API_KEY=...                 # free fallback (console.groq.com)
 RESUME_FILE=resume.txt
 ```
 
-### Resume
+### Your profile
 
-Place `resume.txt` in the project root — a plain-text file with your
-résumé. The bot uses it as candidate context when scoring vacancies and
-generating cover letters.
+The bot reads two gitignored files — copy the `.example` templates and fill in
+your real data:
+
+- `prompts/analyzer_summary.txt` — a SHORT summary (2-4 paragraphs); drives the
+  0-100 relevance score the analyzer assigns each vacancy. Keep it brief — it's
+  sent with every vacancy.
+- `prompts/candidate.txt` — your FULL profile (products, verifiable metrics,
+  an anti-fabrication list of things you have NOT done, opening samples); drives
+  cover-letter generation.
+
+`CANDIDATE_NAME` in `.env` is only the signature name.
 
 ### LLM provider
 
@@ -235,6 +274,22 @@ Setup:
 The monitor only notifies (on Telegram you apply by messaging a recruiter
 yourself), so it runs even in `MANUAL_MODE`. If `t.me` is blocked on your
 network, set `TG_HTTP_PROXY` in `.env`.
+
+## Multiple résumés (optional)
+
+If you keep several targeted hh.ru résumés (one identity each — e.g. Product /
+Engineering / Project), the bot routes each vacancy to the best-fitting one,
+writes the cover letter in that résumé's register, and selects it in the apply
+modal.
+
+1. Edit `ai/resume_variants.py` — replace the 3 example variants with your own
+   (short label, desired role, letter register, and the `signals` that identify
+   the role). Add as many as you have résumés.
+2. `cp resume-variants/feeds.example.yaml resume-variants/feeds.yaml`, then per
+   variant paste its "Похожие вакансии" search URL (it carries the résumé hash)
+   and the résumé title to select on apply. `feeds.yaml` is gitignored.
+
+Leave both unconfigured to run with hh.ru's single default résumé.
 
 ## Known limitations
 
